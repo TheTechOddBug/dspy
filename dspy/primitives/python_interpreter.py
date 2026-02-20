@@ -79,10 +79,6 @@ def _jsonrpc_error(code: int, message: str, id: int | str, data: dict | None = N
     return json.dumps({"jsonrpc": "2.0", "error": err, "id": id})
 
 
-class _SubprocessDied(Exception):
-    """Internal: raised when the Deno subprocess dies during execution."""
-
-
 class PythonInterpreter:
     """Local interpreter for secure Python execution using Deno and Pyodide.
 
@@ -199,40 +195,6 @@ class PythonInterpreter:
                 "PythonInterpreter is not thread-safe and cannot be shared across threads. "
                 "Create a separate interpreter instance for each thread."
             )
-
-    def _kill_process(self) -> None:
-        """Terminate the subprocess and clear the handle to allow restart."""
-        if self.deno_process is not None:
-            try:
-                self.deno_process.kill()
-            except OSError:
-                pass
-            try:
-                self.deno_process.wait(timeout=5)
-            except Exception:
-                pass
-            self.deno_process = None
-
-    def _write_msg(self, msg: str, context: str) -> None:
-        """Write a JSON-RPC message to the subprocess. Raises _SubprocessDied on failure."""
-        try:
-            self.deno_process.stdin.write(msg + "\n")
-            self.deno_process.stdin.flush()
-        except BrokenPipeError:
-            exit_code = self.deno_process.poll()
-            raise _SubprocessDied(f"Deno subprocess died during {context} (exit code: {exit_code})")
-
-    def _read_line(self, context: str) -> str:
-        """Read a line from the subprocess. Raises _SubprocessDied on EOF."""
-        line = self.deno_process.stdout.readline().strip()
-        if not line:
-            exit_code = self.deno_process.poll()
-            stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
-            parts = [f"Deno subprocess produced no output during {context} (exit code: {exit_code})"]
-            if stderr.strip():
-                parts.append(f"Stderr: {stderr.strip()[:500]}")
-            raise _SubprocessDied(". ".join(parts))
-        return line
 
     @staticmethod
     @functools.lru_cache(maxsize=1)
@@ -356,12 +318,11 @@ class PythonInterpreter:
             error_code = JSONRPC_APP_ERRORS.get(error_type, JSONRPC_APP_ERRORS["Unknown"])
             response = _jsonrpc_error(error_code, str(e), request_id, {"type": error_type})
 
-        self._write_msg(response, "tool call response")
+        self.deno_process.stdin.write(response + "\n")
+        self.deno_process.stdin.flush()
 
     def _ensure_deno_process(self) -> None:
         if self.deno_process is None or self.deno_process.poll() is not None:
-            self._tools_registered = False
-            self._mounted_files = False
             try:
                 self.deno_process = subprocess.Popen(
                     self.deno_command,
@@ -388,8 +349,19 @@ class PythonInterpreter:
         """Send a JSON-RPC request and return the parsed response."""
         self._request_id += 1
         request_id = self._request_id
-        self._write_msg(_jsonrpc_request(method, params, request_id), context)
-        response = json.loads(self._read_line(context))
+        msg = _jsonrpc_request(method, params, request_id)
+        self.deno_process.stdin.write(msg + "\n")
+        self.deno_process.stdin.flush()
+
+        response_line = self.deno_process.stdout.readline().strip()
+        if not response_line:
+            exit_code = self.deno_process.poll()
+            if exit_code is not None:
+                stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
+                raise CodeInterpreterError(f"Deno exited (code {exit_code}) {context}: {stderr}")
+            raise CodeInterpreterError(f"No response {context}")
+
+        response = json.loads(response_line)
         if response.get("id") != request_id:
             raise CodeInterpreterError(f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}")
         if "error" in response:
@@ -491,19 +463,6 @@ class PythonInterpreter:
         self._check_thread_ownership()
         variables = variables or {}
         code = self._inject_variables(code, variables)
-
-        try:
-            return self._execute_inner(code)
-        except _SubprocessDied:
-            self._kill_process()
-
-        try:
-            return self._execute_inner(code)
-        except _SubprocessDied as e:
-            raise CodeInterpreterError(f"Deno subprocess failed after automatic restart: {e}")
-
-    def _execute_inner(self, code: str) -> Any:
-        """Run code in the subprocess. Raises _SubprocessDied on process-death conditions."""
         self._ensure_deno_process()
         self._mount_files()
         self._register_tools()
@@ -514,12 +473,30 @@ class PythonInterpreter:
         # Send the code as JSON-RPC request
         self._request_id += 1
         execute_request_id = self._request_id
-        self._write_msg(_jsonrpc_request("execute", {"code": code}, execute_request_id), "execute")
+        input_data = _jsonrpc_request("execute", {"code": code}, execute_request_id)
+        try:
+            self.deno_process.stdin.write(input_data + "\n")
+            self.deno_process.stdin.flush()
+        except BrokenPipeError:
+            # If the process died, restart and try again once
+            self._tools_registered = False
+            self._mounted_files = False
+            self._ensure_deno_process()
+            self._mount_files()
+            self._register_tools()
+            for name, value in self._pending_large_vars.items():
+                self._inject_large_var(name, value)
+            self.deno_process.stdin.write(input_data + "\n")
+            self.deno_process.stdin.flush()
 
         # Read and handle messages until we get the final output.
         # Loop is needed because tool calls require back-and-forth communication.
         while True:
-            output_line = self._read_line("execute")
+            output_line = self.deno_process.stdout.readline().strip()
+            if not output_line:
+                # Possibly the subprocess died or gave no output
+                err_output = self.deno_process.stderr.read()
+                raise CodeInterpreterError(f"No output from Deno subprocess. Stderr: {err_output}")
 
             # Skip non-JSON lines (e.g., Pyodide package loading messages)
             if not output_line.startswith("{"):
